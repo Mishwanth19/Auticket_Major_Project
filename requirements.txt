@@ -1,0 +1,25 @@
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+
+# LangChain Core
+langchain==0.1.5
+langchain-community>=0.0.17,<0.1
+langchain-anthropic==0.1.1
+
+# Vector Store and Embeddings
+faiss-cpu
+sentence-transformers==2.3.1
+
+# LLM Provider
+anthropic==0.18.1
+
+# Utilities
+python-dotenv==1.0.0
+requests==2.31.0
+
+# Development/Testing
+pytest==7.4.4
+pytest-asyncio==0.23.3
+httpx==0.26.0
