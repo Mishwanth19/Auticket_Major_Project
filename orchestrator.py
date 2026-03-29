@@ -1,14 +1,248 @@
+# """
+# FastAPI Orchestrator — MongoDB-backed version
+
+# Changes from original:
+# - Imports RequestStore from database.py
+# - Saves every request + decisions to MongoDB (replaces in-memory dict)
+# - Reads request status from MongoDB
+# - Startup event creates indexes
+# """
+
+# from fastapi import FastAPI, HTTPException, BackgroundTasks
+# from pydantic import BaseModel, Field
+# from typing import List, Dict, Optional
+# from enum import Enum
+# import logging
+# from datetime import datetime
+
+# from requester_agent import RequesterAgent
+# from granter_agent import GranterAgent
+# from database import RequestStore, create_indexes
+
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger(__name__)
+
+# app = FastAPI(
+#     title="Agentic IT Service Approval System",
+#     description="Token-efficient, goal-driven approval automation (MongoDB)",
+#     version="2.0.0",
+# )
+
+# # ============================================================================
+# # MODELS
+# # ============================================================================
+
+# class ToolRequest(BaseModel):
+#     tool_name: str
+#     version: Optional[str] = None
+#     justification: str
+
+# class BatchRequest(BaseModel):
+#     employee_email: str
+#     tools: List[ToolRequest]
+#     urgency: Optional[str] = "normal"
+
+# class DecisionEnum(str, Enum):
+#     APPROVED = "APPROVED"
+#     REJECTED = "REJECTED"
+#     PENDING = "PENDING"
+
+# class ToolDecision(BaseModel):
+#     tool_name: str
+#     decision: DecisionEnum
+#     risk_level: str
+#     policy_reference: str
+#     reason: str
+#     resolution_steps: Optional[str] = None
+
+# class BatchResponse(BaseModel):
+#     request_id: str
+#     decisions: List[ToolDecision]
+#     timestamp: str
+#     overall_status: str
+
+# class ExecutionStatus(BaseModel):
+#     request_id: str
+#     status: str
+#     approved_count: int
+#     rejected_count: int
+#     executed_count: int
+#     details: List[Dict]
+
+# # ============================================================================
+# # AGENTS + STORES
+# # ============================================================================
+
+# requester_agent = RequesterAgent()
+# granter_agent   = GranterAgent()
+# request_store   = RequestStore()          # MongoDB-backed
+
+# # ============================================================================
+# # ENDPOINTS
+# # ============================================================================
+
+# @app.post("/submit-request", response_model=BatchResponse)
+# async def submit_request(request: BatchRequest, background_tasks: BackgroundTasks):
+#     request_id = f"REQ-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+#     logger.info(f"[{request_id}] From {request.employee_email}")
+
+#     try:
+#         # Step 1: Validate
+#         employee_context = requester_agent.retrieve_employee_context(request.employee_email)
+#         validation = requester_agent.validate_request(request.tools, employee_context)
+#         if not validation["valid"]:
+#             raise HTTPException(status_code=400, detail=validation["reason"])
+
+#         # Step 2: LLM evaluation
+#         granter_response = granter_agent.evaluate_batch_request(
+#             request_id=request_id,
+#             tools=request.tools,
+#             employee_context=employee_context,
+#             urgency=request.urgency,
+#         )
+
+#         decisions = granter_response["decisions"]
+#         approved  = [d for d in decisions if d["decision"] == "APPROVED"]
+#         rejected  = [d for d in decisions if d["decision"] == "REJECTED"]
+
+#         overall = (
+#             "FULLY_APPROVED"    if not rejected  else
+#             "FULLY_REJECTED"    if not approved  else
+#             "PARTIALLY_APPROVED"
+#         )
+
+#         # Step 3: Persist to MongoDB
+#         request_store.save_request(
+#             request_id=request_id,
+#             employee_email=request.employee_email,
+#             employee_context=employee_context,
+#             raw_tools=[t.dict() for t in request.tools],
+#             decisions=decisions,
+#             overall_status=overall,
+#         )
+
+#         # Step 4: Background tasks
+#         if approved:
+#             background_tasks.add_task(execute_approved_tools, request_id, approved, employee_context)
+#         if rejected:
+#             background_tasks.add_task(notify_rejections, request_id, rejected, employee_context)
+
+#         return BatchResponse(
+#             request_id=request_id,
+#             decisions=[ToolDecision(**d) for d in decisions],
+#             timestamp=datetime.utcnow().isoformat(),
+#             overall_status=overall,
+#         )
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"[{request_id}] {e}")
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# @app.get("/request-status/{request_id}", response_model=ExecutionStatus)
+# async def get_request_status(request_id: str):
+#     doc = request_store.get_request(request_id)
+#     if not doc:
+#         raise HTTPException(status_code=404, detail="Request not found")
+
+#     decisions     = doc["decisions"]
+#     approved_cnt  = sum(1 for d in decisions if d["decision"] == "APPROVED")
+#     rejected_cnt  = sum(1 for d in decisions if d["decision"] == "REJECTED")
+#     executed_cnt  = sum(1 for d in decisions if d.get("executed", False))
+
+#     return ExecutionStatus(
+#         request_id=request_id,
+#         status=doc.get("status", "unknown"),
+#         approved_count=approved_cnt,
+#         rejected_count=rejected_cnt,
+#         executed_count=executed_cnt,
+#         details=decisions,
+#     )
+
+
+# @app.get("/my-requests/{email}")
+# async def get_user_requests(email: str):
+#     """Return the last 20 requests for a given email (used by the chat UI)."""
+#     return request_store.get_user_requests(email)
+
+
+# @app.get("/health")
+# async def health_check():
+#     return {"status": "healthy", "version": "2.0.0", "store": "mongodb"}
+
+
+# # ============================================================================
+# # BACKGROUND TASKS
+# # ============================================================================
+
+# async def execute_approved_tools(request_id, approved_tools, employee_context):
+#     logger.info(f"[{request_id}] Executing {len(approved_tools)} approved tools")
+#     for tool in approved_tools:
+#         try:
+#             result = requester_agent.execute_tool_provisioning(
+#                 tool_name=tool["tool_name"],
+#                 employee_id=employee_context["employee_id"],
+#                 decision_context=tool,
+#             )
+#             tool["executed"] = result["success"]
+#             tool["execution_timestamp"] = datetime.utcnow().isoformat()
+#         except Exception as e:
+#             tool["executed"] = False
+#             tool["execution_error"] = str(e)
+
+#     # Refresh all decisions in MongoDB
+#     doc = request_store.get_request(request_id)
+#     if doc:
+#         updated = doc["decisions"]
+#         for d in updated:
+#             match = next((t for t in approved_tools if t["tool_name"] == d["tool_name"]), None)
+#             if match:
+#                 d.update(match)
+#         request_store.update_status(request_id, "executed", updated)
+
+#     requester_agent.notify_user(
+#         email=employee_context["email"],
+#         subject=f"Access Request {request_id} - Execution Complete",
+#         approved_tools=[t["tool_name"] for t in approved_tools],
+#     )
+
+
+# async def notify_rejections(request_id, rejected_tools, employee_context):
+#     requester_agent.notify_rejection(
+#         email=employee_context["email"],
+#         request_id=request_id,
+#         rejected_tools=rejected_tools,
+#         manager_email=employee_context.get("manager_email"),
+#     )
+
+
+# # ============================================================================
+# # STARTUP
+# # ============================================================================
+
+# @app.on_event("startup")
+# async def startup_event():
+#     create_indexes()
+#     logger.info("🚀 Auticket API v2 started (MongoDB)")
+
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+
+
+
+
 """
-FastAPI Orchestrator for Agentic IT Service Approval System
+FastAPI Orchestrator — MongoDB-backed version
 
-This orchestrator acts as the deterministic control plane:
-- Routes requests between agents
-- Manages request lifecycle
-- Triggers execution workflows
-- NO LLM calls here - pure coordination logic
-
-Architecture: The orchestrator is the "nervous system" - it coordinates
-but doesn't reason. All reasoning is delegated to specialized agents.
+Changes from original:
+- Imports RequestStore from database.py
+- Saves every request + decisions to MongoDB (replaces in-memory dict)
+- Reads request status from MongoDB
+- Startup event creates indexes
 """
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -18,34 +252,33 @@ from enum import Enum
 import logging
 from datetime import datetime
 
+from fastapi import Header
 from requester_agent import RequesterAgent
 from granter_agent import GranterAgent
+from database import RequestStore, UserStore, SessionStore, create_indexes
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Agentic IT Service Approval System",
-    description="Token-efficient, goal-driven approval automation",
-    version="1.0.0"
+    description="Token-efficient, goal-driven approval automation (MongoDB)",
+    version="2.0.0",
 )
 
 # ============================================================================
-# REQUEST/RESPONSE MODELS
+# MODELS
 # ============================================================================
 
 class ToolRequest(BaseModel):
-    """Individual tool request"""
-    tool_name: str = Field(..., description="Name of software/tool requested")
-    version: Optional[str] = Field(None, description="Specific version if needed")
-    justification: str = Field(..., description="Business justification for access")
+    tool_name: str
+    version: Optional[str] = None
+    justification: str
 
 class BatchRequest(BaseModel):
-    """Batch request from user"""
-    employee_email: str = Field(..., description="Requester's email")
-    tools: List[ToolRequest] = Field(..., description="List of tools requested")
-    urgency: Optional[str] = Field("normal", description="normal/high/critical")
+    employee_email: str
+    tools: List[ToolRequest]
+    urgency: Optional[str] = "normal"
 
 class DecisionEnum(str, Enum):
     APPROVED = "APPROVED"
@@ -53,7 +286,6 @@ class DecisionEnum(str, Enum):
     PENDING = "PENDING"
 
 class ToolDecision(BaseModel):
-    """Decision for a single tool"""
     tool_name: str
     decision: DecisionEnum
     risk_level: str
@@ -62,14 +294,12 @@ class ToolDecision(BaseModel):
     resolution_steps: Optional[str] = None
 
 class BatchResponse(BaseModel):
-    """Response after granter evaluation"""
     request_id: str
     decisions: List[ToolDecision]
     timestamp: str
     overall_status: str
 
 class ExecutionStatus(BaseModel):
-    """Status response for request tracking"""
     request_id: str
     status: str
     approved_count: int
@@ -77,256 +307,312 @@ class ExecutionStatus(BaseModel):
     executed_count: int
     details: List[Dict]
 
+# Auth models
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    name: str
+    role: Optional[str] = "Software Engineer"
+    department: Optional[str] = "Engineering"
+    security_clearance: Optional[str] = "standard"
+    location: Optional[str] = "Unknown"
+    manager_email: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class LoginResponse(BaseModel):
+    token: str
+    email: str
+    name: str
+    role: str
+    department: str
+    message: str
+
 # ============================================================================
-# AGENT INITIALIZATION
+# AGENTS + STORES
 # ============================================================================
 
-# Initialize agents once at startup (singleton pattern)
 requester_agent = RequesterAgent()
-granter_agent = GranterAgent()
-
-# In-memory request tracking (use Redis/DB in production)
-request_store: Dict[str, Dict] = {}
+granter_agent   = GranterAgent()
+request_store   = RequestStore()
+user_store      = UserStore()
+session_store   = SessionStore()
 
 # ============================================================================
-# CORE ENDPOINTS
+# ENDPOINTS
 # ============================================================================
 
 @app.post("/submit-request", response_model=BatchResponse)
-async def submit_request(
-    request: BatchRequest,
-    background_tasks: BackgroundTasks
-) -> BatchResponse:
-    """
-    Main entry point for tool access requests.
-    
-    Workflow:
-    1. Validate and enrich request (via Requester Agent)
-    2. Send to Granter Agent for policy evaluation
-    3. Return structured decision
-    4. Trigger execution in background for approved tools
-    
-    This is deterministic orchestration - no LLM reasoning here.
-    """
+async def submit_request(request: BatchRequest, background_tasks: BackgroundTasks):
     request_id = f"REQ-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-    
-    logger.info(f"[{request_id}] Received request from {request.employee_email}")
-    logger.info(f"[{request_id}] Tools requested: {[t.tool_name for t in request.tools]}")
-    
+    logger.info(f"[{request_id}] From {request.employee_email}")
+
     try:
-        # ====================================================================
-        # STEP 1: REQUESTER AGENT - Validate and enrich request
-        # ====================================================================
-        # Deterministic operations: no LLM, just data retrieval and validation
-        
-        employee_context = requester_agent.retrieve_employee_context(
-            request.employee_email
-        )
-        
-        validation_result = requester_agent.validate_request(
-            tools=request.tools,
-            employee_context=employee_context
-        )
-        
-        if not validation_result["valid"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid request: {validation_result['reason']}"
-            )
-        
-        # ====================================================================
-        # STEP 2: GRANTER AGENT - Policy reasoning and approval decision
-        # ====================================================================
-        # LLM reasoning happens here - ONE call for the entire batch
-        
-        logger.info(f"[{request_id}] Sending to Granter Agent for evaluation")
-        
+        # Step 1: Validate
+        employee_context = requester_agent.retrieve_employee_context(request.employee_email)
+        validation = requester_agent.validate_request(request.tools, employee_context)
+        if not validation["valid"]:
+            raise HTTPException(status_code=400, detail=validation["reason"])
+
+        # Step 2: LLM evaluation
         granter_response = granter_agent.evaluate_batch_request(
             request_id=request_id,
             tools=request.tools,
             employee_context=employee_context,
-            urgency=request.urgency
+            urgency=request.urgency,
         )
-        
-        # ====================================================================
-        # STEP 3: Store and prepare response
-        # ====================================================================
-        
-        request_store[request_id] = {
-            "request": request.dict(),
-            "employee_context": employee_context,
-            "decisions": granter_response["decisions"],
-            "timestamp": datetime.utcnow().isoformat(),
-            "status": "evaluated"
-        }
-        
-        # Count approvals/rejections
-        approved = [d for d in granter_response["decisions"] if d["decision"] == "APPROVED"]
-        rejected = [d for d in granter_response["decisions"] if d["decision"] == "REJECTED"]
-        
-        overall_status = "FULLY_APPROVED" if len(rejected) == 0 else \
-                        "FULLY_REJECTED" if len(approved) == 0 else \
-                        "PARTIALLY_APPROVED"
-        
-        response = BatchResponse(
+
+        decisions = granter_response["decisions"]
+        approved  = [d for d in decisions if d["decision"] == "APPROVED"]
+        rejected  = [d for d in decisions if d["decision"] == "REJECTED"]
+
+        overall = (
+            "FULLY_APPROVED"    if not rejected  else
+            "FULLY_REJECTED"    if not approved  else
+            "PARTIALLY_APPROVED"
+        )
+
+        # Step 3: Persist to MongoDB
+        request_store.save_request(
             request_id=request_id,
-            decisions=[ToolDecision(**d) for d in granter_response["decisions"]],
-            timestamp=datetime.utcnow().isoformat(),
-            overall_status=overall_status
+            employee_email=request.employee_email,
+            employee_context=employee_context,
+            raw_tools=[t.dict() for t in request.tools],
+            decisions=decisions,
+            overall_status=overall,
         )
-        
-        # ====================================================================
-        # STEP 4: Trigger execution in background for approved tools
-        # ====================================================================
-        
-        if len(approved) > 0:
-            background_tasks.add_task(
-                execute_approved_tools,
-                request_id,
-                approved,
-                employee_context
-            )
-        
-        # Send notifications for rejected tools
-        if len(rejected) > 0:
-            background_tasks.add_task(
-                notify_rejections,
-                request_id,
-                rejected,
-                employee_context
-            )
-        
-        logger.info(f"[{request_id}] Evaluation complete: {len(approved)} approved, {len(rejected)} rejected")
-        
-        return response
-        
+
+        # Step 4: Background tasks
+        if approved:
+            background_tasks.add_task(execute_approved_tools, request_id, approved, employee_context)
+        if rejected:
+            background_tasks.add_task(notify_rejections, request_id, rejected, employee_context)
+
+        return BatchResponse(
+            request_id=request_id,
+            decisions=[ToolDecision(**d) for d in decisions],
+            timestamp=datetime.utcnow().isoformat(),
+            overall_status=overall,
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"[{request_id}] Error processing request: {str(e)}")
+        logger.error(f"[{request_id}] {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/request-status/{request_id}", response_model=ExecutionStatus)
-async def get_request_status(request_id: str) -> ExecutionStatus:
-    """
-    Check the status of a submitted request.
-    Useful for tracking execution progress.
-    """
-    if request_id not in request_store:
+async def get_request_status(request_id: str):
+    doc = request_store.get_request(request_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="Request not found")
-    
-    stored_request = request_store[request_id]
-    decisions = stored_request["decisions"]
-    
-    approved = [d for d in decisions if d["decision"] == "APPROVED"]
-    rejected = [d for d in decisions if d["decision"] == "REJECTED"]
-    
-    # Check execution status
-    executed_count = sum(1 for d in decisions if d.get("executed", False))
-    
+
+    decisions     = doc["decisions"]
+    approved_cnt  = sum(1 for d in decisions if d["decision"] == "APPROVED")
+    rejected_cnt  = sum(1 for d in decisions if d["decision"] == "REJECTED")
+    executed_cnt  = sum(1 for d in decisions if d.get("executed", False))
+
     return ExecutionStatus(
         request_id=request_id,
-        status=stored_request.get("status", "unknown"),
-        approved_count=len(approved),
-        rejected_count=len(rejected),
-        executed_count=executed_count,
-        details=decisions
+        status=doc.get("status", "unknown"),
+        approved_count=approved_cnt,
+        rejected_count=rejected_cnt,
+        executed_count=executed_cnt,
+        details=decisions,
     )
+
+
+@app.get("/my-requests/{email}")
+async def get_user_requests(email: str):
+    """Return the last 20 requests for a given email (used by the chat UI)."""
+    return request_store.get_user_requests(email)
+
+
+# ============================================================================
+# AUTH ENDPOINTS
+# ============================================================================
+
+def _resolve_session(authorization: Optional[str]) -> Optional[Dict]:
+    """
+    Helper: extract Bearer token from Authorization header and
+    return the user dict, or None if invalid/expired.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    session = session_store.get_session(token)
+    if not session:
+        return None
+    return user_store.get_by_email(session["email"])
+
+
+@app.post("/auth/signup", status_code=201)
+async def signup(body: SignupRequest):
+    """
+    Register a new user.
+    Stores email (lowercased), hashed password, and profile in the
+    `users` collection.
+    """
+    try:
+        user_store.create_user(
+            email=body.email,
+            password=body.password,
+            name=body.name,
+            role=body.role,
+            department=body.department,
+            security_clearance=body.security_clearance,
+            location=body.location,
+            manager_email=body.manager_email,
+        )
+        logger.info(f"New user registered: {body.email}")
+        return {"message": "Account created successfully. You can now log in."}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(body: LoginRequest):
+    """
+    Authenticate user, create a session in the `sessions` collection,
+    and return a Bearer token.
+    """
+    user = user_store.authenticate(body.email, body.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    token = session_store.create_session(user["email"])
+    logger.info(f"User logged in: {user['email']}")
+
+    return LoginResponse(
+        token=token,
+        email=user["email"],
+        name=user.get("name", ""),
+        role=user.get("role", ""),
+        department=user.get("department", ""),
+        message=f"Welcome back, {user.get('name', user['email'])}!",
+    )
+
+
+@app.post("/auth/logout")
+async def logout_endpoint(authorization: Optional[str] = Header(None)):
+    """
+    Invalidate the session token.
+    Pass the token as:  Authorization: Bearer <token>
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=400, detail="Missing Authorization header.")
+    token = authorization.split(" ", 1)[1].strip()
+    session_store.delete_session(token)
+    return {"message": "Logged out successfully."}
+
+
+# ============================================================================
+# USER ENDPOINTS
+# ============================================================================
+
+@app.get("/users/me")
+async def get_me(authorization: Optional[str] = Header(None)):
+    """
+    Return the profile of the currently logged-in user.
+    Reads from the `users` collection using the session token.
+    """
+    user = _resolve_session(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+
+    # Strip internal fields before returning
+    return {
+        "email":              user["email"],
+        "name":               user.get("name"),
+        "role":               user.get("role"),
+        "department":         user.get("department"),
+        "security_clearance": user.get("security_clearance"),
+        "location":           user.get("location"),
+        "manager_email":      user.get("manager_email"),
+        "created_at":         str(user.get("created_at", "")),
+    }
+
+
+@app.get("/users/me/requests")
+async def get_my_requests(authorization: Optional[str] = Header(None)):
+    """
+    Return the last 20 approval requests for the logged-in user.
+    Reads from the `requests` collection filtered by email.
+    """
+    user = _resolve_session(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session.")
+
+    docs = request_store.get_user_requests(user["email"])
+
+    # Serialize datetime fields for JSON
+    for doc in docs:
+        if "created_at" in doc:
+            doc["created_at"] = str(doc["created_at"])
+    return docs
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "agentic-approval-orchestrator",
-        "agents": {
-            "requester": "active",
-            "granter": "active"
-        }
-    }
+    return {"status": "healthy", "version": "2.0.0", "store": "mongodb"}
+
 
 # ============================================================================
-# BACKGROUND EXECUTION TASKS
+# BACKGROUND TASKS
 # ============================================================================
 
-async def execute_approved_tools(
-    request_id: str,
-    approved_tools: List[Dict],
-    employee_context: Dict
-):
-    """
-    Execute installation/provisioning for approved tools.
-    Runs in background to avoid blocking the response.
-    
-    This is deterministic execution - no LLM reasoning.
-    """
-    logger.info(f"[{request_id}] Starting execution for {len(approved_tools)} approved tools")
-    
-    for tool_decision in approved_tools:
+async def execute_approved_tools(request_id, approved_tools, employee_context):
+    logger.info(f"[{request_id}] Executing {len(approved_tools)} approved tools")
+    for tool in approved_tools:
         try:
-            # Use Requester Agent to handle execution
-            execution_result = requester_agent.execute_tool_provisioning(
-                tool_name=tool_decision["tool_name"],
+            result = requester_agent.execute_tool_provisioning(
+                tool_name=tool["tool_name"],
                 employee_id=employee_context["employee_id"],
-                decision_context=tool_decision
+                decision_context=tool,
             )
-            
-            # Update execution status
-            tool_decision["executed"] = execution_result["success"]
-            tool_decision["execution_timestamp"] = datetime.utcnow().isoformat()
-            
-            logger.info(f"[{request_id}] Executed {tool_decision['tool_name']}: {execution_result['status']}")
-            
+            tool["executed"] = result["success"]
+            tool["execution_timestamp"] = datetime.utcnow().isoformat()
         except Exception as e:
-            logger.error(f"[{request_id}] Execution failed for {tool_decision['tool_name']}: {str(e)}")
-            tool_decision["executed"] = False
-            tool_decision["execution_error"] = str(e)
-    
-    # Update overall request status
-    request_store[request_id]["status"] = "executed"
-    
-    # Notify user of completion
+            tool["executed"] = False
+            tool["execution_error"] = str(e)
+
+    # Refresh all decisions in MongoDB
+    doc = request_store.get_request(request_id)
+    if doc:
+        updated = doc["decisions"]
+        for d in updated:
+            match = next((t for t in approved_tools if t["tool_name"] == d["tool_name"]), None)
+            if match:
+                d.update(match)
+        request_store.update_status(request_id, "executed", updated)
+
     requester_agent.notify_user(
         email=employee_context["email"],
         subject=f"Access Request {request_id} - Execution Complete",
-        approved_tools=[t["tool_name"] for t in approved_tools]
+        approved_tools=[t["tool_name"] for t in approved_tools],
     )
 
 
-async def notify_rejections(
-    request_id: str,
-    rejected_tools: List[Dict],
-    employee_context: Dict
-):
-    """
-    Send notifications for rejected tools with resolution steps.
-    """
-    logger.info(f"[{request_id}] Sending rejection notifications for {len(rejected_tools)} tools")
-    
+async def notify_rejections(request_id, rejected_tools, employee_context):
     requester_agent.notify_rejection(
         email=employee_context["email"],
         request_id=request_id,
         rejected_tools=rejected_tools,
-        manager_email=employee_context.get("manager_email")
+        manager_email=employee_context.get("manager_email"),
     )
 
 
 # ============================================================================
-# STARTUP/SHUTDOWN
+# STARTUP
 # ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize system on startup"""
-    logger.info("🚀 Agentic IT Approval System starting up")
-    logger.info("✓ Requester Agent initialized")
-    logger.info("✓ Granter Agent initialized (with RAG)")
-    logger.info("✓ Orchestrator ready")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("🛑 Shutting down Agentic IT Approval System")
+    create_indexes()
+    logger.info("🚀 Auticket API v2 started (MongoDB)")
 
 
 if __name__ == "__main__":

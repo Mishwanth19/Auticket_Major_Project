@@ -1,25 +1,30 @@
-# Core Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
-pydantic==2.5.3
+# Auticket v2 — Python dependencies
 
-# LangChain Core
-langchain==0.1.5
-langchain-community>=0.0.17,<0.1
-langchain-anthropic==0.1.1
+# Web framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
 
-# Vector Store and Embeddings
-faiss-cpu
-sentence-transformers==2.3.1
+# Data validation
+pydantic>=2.0.0
+python-dotenv>=1.0.0
 
-# LLM Provider
-anthropic==0.18.1
+# MongoDB
+pymongo>=4.7.0
+
+# LangChain + AI
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-groq>=0.1.5
+langchain-huggingface>=0.0.3
+
+# Embeddings + Vector store
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# Frontend
+streamlit>=1.35.0
+requests>=2.31.0
 
 # Utilities
-python-dotenv==1.0.0
-requests==2.31.0
-
-# Development/Testing
-pytest==7.4.4
-pytest-asyncio==0.23.3
-httpx==0.26.0
+httpx>=0.27.0
